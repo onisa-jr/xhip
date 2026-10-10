@@ -1,0 +1,16 @@
+Package: xhip
+Version: 0.1.0
+Architecture: amd64
+Maintainer: onisajr@gmail.com
+Priority: optional
+Section: utils
+Filename: pool/main/x/xhip/xhip_0.1.0_amd64.deb
+Size: 2071108
+SHA256: 444f6dc27c703d0b844ce1e681dd6748102c215e440c7872c285a33a7b60081f
+SHA1: c5ed6f57b1bdd6ffd944632a0ae9684f089c65e2
+MD5sum: 79c8cc8e31b60ccd7bb178bcc7f1644f
+Description: Simple, secure code shipping CLI to any VPS
+ Xhip is a lightweight CLI for transferring private project source code
+ from a developer's local machine to any VPS using Cloudflare R2 object
+ storage and temporary presigned download URLs.
+

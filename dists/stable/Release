@@ -1,0 +1,19 @@
+Origin: Xhip
+Label: Xhip
+Codename: stable
+Date: Sat, 10 Oct 2026 10:20:20 UTC
+Architectures: amd64
+Components: main
+Description: Xhip CLI APT Repository
+MD5Sum:
+ ae5603694c782cc2aff44420acbcbbd8 586 main/binary-amd64/Packages
+ 6b5a26b8c196becd21f5a16521ff694f 434 main/binary-amd64/Packages.gz
+ bce205cab7164d2ab184cc39e2b0b688 98 main/binary-amd64/Release
+SHA1:
+ 335b89388cdb13eefde2a5f034332e56e96365dd 586 main/binary-amd64/Packages
+ 7ebb7faafb0dfbd957c3e344c7ec8960cf2796dc 434 main/binary-amd64/Packages.gz
+ 4cf8e1245d1d6683602ebdd70afed5f638ac87aa 98 main/binary-amd64/Release
+SHA256:
+ 80fd3d0befe960a27d5c1d5409f978c51b44c25846155dea1c637af8e3df5d34 586 main/binary-amd64/Packages
+ 7011bb848a1902639c931a5f53cb93a5f56bba33e1884653d7ce0165adb5af0a 434 main/binary-amd64/Packages.gz
+ eaba7ad0846db7680a8e69f16dad16d8334f0cb4609b2495d19e771c82b05714 98 main/binary-amd64/Release

@@ -1,0 +1,5 @@
+Component: main
+Origin: Xhip
+Label: Xhip
+Architecture: amd64
+Description: Xhip CLI APT Repository
