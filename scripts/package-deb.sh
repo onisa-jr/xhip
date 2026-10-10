@@ -23,7 +23,7 @@ Version: ${VERSION}
 Section: utils
 Priority: optional
 Architecture: ${ARCH}
-Maintainer: Xhip Team <hello@xhip.dev>
+Maintainer: onisajr@gmail.com
 Description: Simple, secure code shipping CLI to any VPS
  Xhip is a lightweight CLI for transferring private project source code
  from a developer's local machine to any VPS using Cloudflare R2 object
