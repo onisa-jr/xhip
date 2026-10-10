@@ -1,0 +1,48 @@
+# .xhipignore - Patterns to exclude when packaging with Xhip
+# Syntax is the same as .gitignore:
+#   - '#' starts a comment
+#   - Prepend '!' to re-include a file or pattern
+#   - Trailing '/' matches directories only
+
+# Sensitive files and secrets (NEVER upload to untrusted targets)
+.env
+.env.*
+*.key
+*.id_rsa
+*.id_ed25519
+id_rsa
+id_ed25519
+*.pfx
+*.p12
+*.pkcs12
+
+# Version control systems
+.git/
+.gitignore
+.gitattributes
+.hg/
+.svn/
+
+# Dependencies and virtual environments
+node_modules/
+vendor/
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.tox/
+
+# Build outputs and compilation artifacts
+target/
+dist/
+build/
+.next/
+.nuxt/
+.turbo/
+.cache/
+*.log
+.DS_Store
+Thumbs.db
