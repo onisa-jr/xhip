@@ -8,13 +8,32 @@ The VPS never needs Cloudflare R2 credentials.
 
 ## Installation
 
-### Debian / Ubuntu
+### One-Command Installer (Debian / Ubuntu amd64)
 ```bash
-sudo apt install ./xhip.deb
+curl -fsSL https://onisa-jr.github.io/xhip/install.sh -o install.sh
+sudo bash install.sh
 ```
 
-### From source
+### Or Manual APT Setup
 ```bash
+# Add signing key
+sudo mkdir -p /etc/apt/keyrings
+curl -fsSL https://onisa-jr.github.io/xhip/xhip-archive-keyring.asc | sudo gpg --dearmor -o /etc/apt/keyrings/xhip.gpg
+
+# Add repository
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/xhip.gpg] https://onisa-jr.github.io/xhip stable main" | sudo tee /etc/apt/sources.list.d/xhip.list
+
+# Install
+sudo apt update
+sudo apt install xhip
+```
+
+### From Local Package / Source
+```bash
+# From .deb package
+sudo apt install ./xhip.deb
+
+# From source
 cargo install --path .
 ```
 
