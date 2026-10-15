@@ -14,20 +14,6 @@ curl -fsSL https://onisa-jr.github.io/xhip/install.sh -o install.sh
 sudo bash install.sh
 ```
 
-### Or Manual APT Setup
-```bash
-# Add signing key
-sudo mkdir -p /etc/apt/keyrings
-curl -fsSL https://onisa-jr.github.io/xhip/xhip-archive-keyring.asc | sudo gpg --dearmor -o /etc/apt/keyrings/xhip.gpg
-
-# Add repository
-echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/xhip.gpg] https://onisa-jr.github.io/xhip stable main" | sudo tee /etc/apt/sources.list.d/xhip.list
-
-# Install
-sudo apt update
-sudo apt install xhip
-```
-
 ### From Local Package / Source
 ```bash
 # From .deb package
@@ -46,43 +32,63 @@ cargo install --path .
 xhip setup
 ```
 
-Check configuration:
+Check configuration and limits:
 ```bash
 xhip status
 ```
 
 ### 2. Push project source
 ```bash
-# In your project folder
+# In your project folder (auto-detects project name without prompting!)
 xhip push
 
-# Or preview packaging in a tree view first:
+# Or push and immediately generate a shipping link in one command:
+xhip push --link
+
+# Or preview packaging in a clean tree view first:
 xhip push --dry-run
 ```
 > [!NOTE]
-> When run for the first time, Xhip automatically generates `.xhipignore` in your project with default exclusions (`.env`, `.git`, `node_modules`, build artifacts, keys). Edit `.xhipignore` to customize exclusions.
+> **Smart `.xhipignore`**:
+> When run for the first time, Xhip automatically copies your existing `.gitignore` into `.xhipignore`. If no `.gitignore` is present, it creates an empty `.xhipignore`. You can force re-sync at any time with `xhip push --sync-ignore`.
+>
+> Git metadata (`.git/`) and secrets (`.env`) are excluded by default.
 
-### 3. Generate a temporary download URL
+### 3. Generate a temporary download link
 ```bash
+# Inside your project folder (project name is auto-detected!)
+xhip link
+
+# Or explicitly for any project:
 xhip link <project-name>
 ```
 
-Output:
+Clean, formatted output with automatic link shortening:
 ```text
-Project:  <project-name> (v20261010093011, 10m expiry)
-URL:      https://<account-id>.r2.cloudflarestorage.com/...
+╭────────────────────────────────────────────────────────────────────╮
+│  🚀 XHIP SHIPPING LINK                                             │
+╰────────────────────────────────────────────────────────────────────╯
+  Project:        my-app
+  Version:        v20261015054800
+  Expires:        10 minutes
 
-Pull command for VPS:
-  xhip pull --url "https://..."
+  🔗 Short Shipping Link:
+     https://da.gd/MBHbr
+
+  📋 VPS Pull Command (run on remote server):
+     xhip pull --url "https://da.gd/MBHbr"
+
+  🔒 Direct Storage URL:
+     https://<account-id>.r2.cloudflarestorage.com/...
 ```
 
 ### 4. Pull and deploy on VPS
 ```bash
-# Using the generated command
-xhip pull --url "<shipping-url>"
+# Using the shortened shipping link
+xhip pull --url "https://da.gd/MBHbr"
 
 # Or specify destination directory:
-xhip pull --url "<shipping-url>" --dir /opt/apps/my-app
+xhip pull --url "https://da.gd/MBHbr" --dir /opt/apps/my-app
 
 # Or prompt interactively:
 xhip pull
@@ -93,12 +99,23 @@ xhip pull
 ## Commands
 
 - `xhip setup` — configure and validate Cloudflare R2 credentials
-- `xhip push [PATH] [--name NAME] [--dry-run]` — package and upload project source
-- `xhip link NAME [--version VER] [--expires MIN]` — generate temporary presigned download URL
+- `xhip push [PATH] [--name NAME] [--link] [--sync-ignore] [--dry-run]` — package and upload project source (auto-detects project name)
+- `xhip link [NAME] [--version VER] [--expires MIN] [--no-short]` — generate temporary shortened download link and VPS pull command
 - `xhip pull [--url URL] [--dir PATH]` — download and safely deploy archive
 - `xhip list [NAME]` — list uploaded projects and versions
-- `xhip status` — check configuration status
-- `xhip --help` — show help
+- `xhip status` — check configuration status and upload limits
+- `xhip --help` — show help and guidelines
+
+---
+
+## Storage Limits & Large Files
+
+| Parameter | Limit / Recommendation | Details |
+|---|---|---|
+| **Max Archive Size** | **5 GB** | Hard single PUT object upload limit imposed by Cloudflare R2 / S3. |
+| **Recommended Size** | **< 500 MB** | For fast packaging, uploads, and remote VPS deployments. |
+| **Large File Warning** | **50 MB** | Xhip warns during scanning if files $\ge$ 50 MB are packaged so you can add them to `.xhipignore` if unnecessary. |
+| **Streaming Memory** | **64 KB Buffer** | Files are hashed via streaming chunks, preventing RAM exhaustion on large files. |
 
 ---
 
@@ -106,6 +123,6 @@ xhip pull
 
 - R2 credentials exist only on the trusted local workstation (`0600` permissions).
 - Presigned URLs are short-lived bearer credentials (default 10 minutes).
-- Sensitive files (`.env`, private keys) and build caches are excluded by default via `.xhipignore`.
+- Sensitive files (`.env`, private keys) and `.git` are excluded by default.
 - Archives are checked for path traversal (`..` attacks) and verified via SHA-256 manifest.
-- VPS deployments preserve existing runtime data (`.env`, SQLite databases, uploads).
+- VPS deployments preserve existing live runtime data (`.env`, SQLite databases, uploads).

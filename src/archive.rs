@@ -4,77 +4,83 @@ use ignore::WalkBuilder;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-// Default template content for auto-generated .xhipignore
-pub const DEFAULT_XHIPIGNORE_TEMPLATE: &str = r#"# .xhipignore - Patterns to exclude when packaging with Xhip
-# Syntax is the same as .gitignore:
-#   - '#' starts a comment
-#   - Prepend '!' to re-include a file or pattern
-#   - Trailing '/' matches directories only
+/// Cloudflare R2 / AWS S3 single PUT object size limit (5 GB)
+pub const MAX_ARCHIVE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
-# Sensitive files and secrets (NEVER upload to untrusted targets)
-.env
-.env.*
-*.pem
-*.key
-*.id_rsa
-*.id_ed25519
-id_rsa
-id_ed25519
-*.pfx
-*.p12
-*.pkcs12
-
-# Version control systems
-.git/
-.gitignore
-.gitattributes
-.hg/
-.svn/
-
-# Dependencies and virtual environments
-node_modules/
-vendor/
-.venv/
-venv/
-env/
-__pycache__/
-*.pyc
-.pytest_cache/
-.mypy_cache/
-.tox/
-
-# Build outputs and compilation artifacts
-target/
-dist/
-build/
-.next/
-.nuxt/
-.turbo/
-.cache/
-*.log
-.DS_Store
-Thumbs.db
-"#;
+/// Threshold to warn users of unusually large individual files (50 MB)
+pub const LARGE_FILE_WARN_THRESHOLD: u64 = 50 * 1024 * 1024;
 
 pub struct PackageResult {
     pub tar_gz_bytes: Vec<u8>,
     pub checksum_hex: String,
+    pub uncompressed_size_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct LargeFileInfo {
+    pub relative_path: String,
+    pub size_bytes: u64,
 }
 
 /// Automatically ensures .xhipignore exists in the project root.
-/// Returns true if a new file was created.
-pub fn ensure_xhipignore(root: &Path) -> Result<bool, String> {
+/// If .gitignore exists, .xhipignore copies its contents.
+/// If no .gitignore exists, an empty .xhipignore is created.
+/// Returns Ok((created, description)).
+pub fn ensure_xhipignore(root: &Path) -> Result<(bool, &'static str), String> {
     let xhipignore_path = root.join(".xhipignore");
     if !xhipignore_path.exists() {
-        fs::write(&xhipignore_path, DEFAULT_XHIPIGNORE_TEMPLATE)
-            .map_err(|e| format!("Failed to create .xhipignore at {}: {}", xhipignore_path.display(), e))?;
-        Ok(true)
+        let gitignore_path = root.join(".gitignore");
+        if gitignore_path.exists() {
+            let gitignore_content = fs::read_to_string(&gitignore_path).unwrap_or_default();
+            fs::write(&xhipignore_path, gitignore_content)
+                .map_err(|e| format!("Failed to create .xhipignore at {}: {}", xhipignore_path.display(), e))?;
+            Ok((true, "copied from .gitignore"))
+        } else {
+            fs::write(&xhipignore_path, "")
+                .map_err(|e| format!("Failed to create .xhipignore at {}: {}", xhipignore_path.display(), e))?;
+            Ok((true, "created empty"))
+        }
     } else {
-        Ok(false)
+        Ok((false, "already exists"))
     }
+}
+
+/// Force sync/update .xhipignore from .gitignore (or empty if no .gitignore)
+pub fn sync_xhipignore(root: &Path) -> Result<&'static str, String> {
+    let xhipignore_path = root.join(".xhipignore");
+    let gitignore_path = root.join(".gitignore");
+    if gitignore_path.exists() {
+        let gitignore_content = fs::read_to_string(&gitignore_path).unwrap_or_default();
+        fs::write(&xhipignore_path, gitignore_content)
+            .map_err(|e| format!("Failed to write .xhipignore at {}: {}", xhipignore_path.display(), e))?;
+        Ok("synced from .gitignore")
+    } else {
+        fs::write(&xhipignore_path, "")
+            .map_err(|e| format!("Failed to write .xhipignore at {}: {}", xhipignore_path.display(), e))?;
+        Ok("reset to empty")
+    }
+}
+
+pub fn scan_large_files(root: &Path, files: &[PathBuf]) -> Vec<LargeFileInfo> {
+    let mut large_files = Vec::new();
+    for file in files {
+        if let Ok(meta) = fs::metadata(file) {
+            let size = meta.len();
+            if size >= LARGE_FILE_WARN_THRESHOLD {
+                if let Ok(rel) = file.strip_prefix(root) {
+                    large_files.push(LargeFileInfo {
+                        relative_path: rel.to_string_lossy().to_string(),
+                        size_bytes: size,
+                    });
+                }
+            }
+        }
+    }
+    large_files.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+    large_files
 }
 
 pub fn collect_files(
@@ -101,13 +107,6 @@ pub fn collect_files(
 
     // Additional overrides or custom options
     let mut overrides = ignore::overrides::OverrideBuilder::new(root);
-
-    // If custom_include_env is requested, add an override rule to include .env
-    if custom_include_env {
-        let _ = overrides.add("!.env");
-        let _ = overrides.add("!.env.*");
-    }
-
     for pattern in additional_ignores {
         let rule = format!("!{}", pattern);
         let _ = overrides.add(&rule);
@@ -125,6 +124,26 @@ pub fn collect_files(
                 if path == root {
                     continue;
                 }
+                if let Ok(rel) = path.strip_prefix(root) {
+                    // Always exclude git internal repository files and directories
+                    if rel.components().any(|c| c.as_os_str() == ".git") {
+                        continue;
+                    }
+                    // Exclude VCS & xhip metadata files from shipped archive
+                    if let Some(name) = rel.file_name().and_then(|n| n.to_str()) {
+                        if name == ".gitignore" || name == ".gitattributes" || name == ".xhipignore" || name == ".xhip" {
+                            continue;
+                        }
+                    }
+                    // Exclude .env files unless explicitly included
+                    if !custom_include_env {
+                        if let Some(name) = rel.file_name().and_then(|n| n.to_str()) {
+                            if name == ".env" || name.starts_with(".env.") {
+                                continue;
+                            }
+                        }
+                    }
+                }
                 // Do not pack directory entries directly, only regular files or symlinks
                 if path.is_file() || path.is_symlink() {
                     files.push(path.to_path_buf());
@@ -138,11 +157,27 @@ pub fn collect_files(
     Ok(files)
 }
 
+/// Compute SHA-256 using a streaming 64 KB buffer to avoid reading large files into RAM
+pub fn hash_file_sha256(path: &Path) -> Result<String, std::io::Error> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
 pub fn create_archive(
     root: &Path,
     files: &[PathBuf],
 ) -> Result<PackageResult, String> {
     let mut buffer = Vec::new();
+    let mut uncompressed_size: u64 = 0;
     {
         let enc = GzEncoder::new(&mut buffer, Compression::best());
         let mut tar_builder = tar::Builder::new(enc);
@@ -160,6 +195,10 @@ pub fn create_archive(
                 return Err(format!("Unsafe file path detected during packaging: {}", rel_str));
             }
 
+            if let Ok(meta) = fs::metadata(file) {
+                uncompressed_size += meta.len();
+            }
+
             let mut f = File::open(file)
                 .map_err(|e| format!("Failed to open file {}: {}", file.display(), e))?;
 
@@ -170,14 +209,11 @@ pub fn create_archive(
             included_rel_paths.push(rel_str);
         }
 
-        // Calculate and embed a checksum manifest
+        // Calculate and embed a checksum manifest using streaming hash
         let mut manifest_bytes = Vec::new();
         for path_str in &included_rel_paths {
             let full_p = root.join(path_str);
-            if let Ok(content) = fs::read(&full_p) {
-                let mut hasher = Sha256::new();
-                hasher.update(&content);
-                let hex_hash = hex::encode(hasher.finalize());
+            if let Ok(hex_hash) = hash_file_sha256(&full_p) {
                 let _ = writeln!(manifest_bytes, "{}  {}", hex_hash, path_str);
             }
         }
@@ -197,6 +233,15 @@ pub fn create_archive(
             .map_err(|e| format!("Failed to finish gzip compression: {}", e))?;
     }
 
+    let archive_len = buffer.len() as u64;
+    if archive_len > MAX_ARCHIVE_BYTES {
+        return Err(format!(
+            "Archive size ({}) exceeds Cloudflare R2 single upload limit of 5 GB.\n\
+             Please exclude large files (e.g. build artifacts, databases, media) via .xhipignore.",
+            format_bytes(archive_len)
+        ));
+    }
+
     let mut hasher = Sha256::new();
     hasher.update(&buffer);
     let checksum_hex = hex::encode(hasher.finalize());
@@ -204,7 +249,24 @@ pub fn create_archive(
     Ok(PackageResult {
         tar_gz_bytes: buffer,
         checksum_hex,
+        uncompressed_size_bytes: uncompressed_size,
     })
+}
+
+pub fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
 }
 
 /// Node representing a file or directory in the tree preview
@@ -268,7 +330,56 @@ pub fn render_file_tree(root_name: &str, rel_paths: &[PathBuf]) -> String {
 }
 
 pub fn detect_project_name(dir: &Path) -> String {
-    // 1. If in a git repository, try to read git root name
+    // 0. Check for local .xhip configuration
+    let xhip_file = dir.join(".xhip");
+    if let Ok(content) = fs::read_to_string(&xhip_file) {
+        let trimmed = content.trim();
+        if !trimmed.is_empty() {
+            return sanitize_project_name(trimmed);
+        }
+    }
+
+    // 1. Check Cargo.toml
+    let cargo_toml = dir.join("Cargo.toml");
+    if let Ok(content) = fs::read_to_string(&cargo_toml) {
+        if let Ok(val) = toml::from_str::<toml::Value>(&content) {
+            if let Some(pkg) = val.get("package") {
+                if let Some(name) = pkg.get("name").and_then(|n| n.as_str()) {
+                    if !name.is_empty() {
+                        return sanitize_project_name(name);
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Check package.json
+    let package_json = dir.join("package.json");
+    if let Ok(content) = fs::read_to_string(&package_json) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(name) = val.get("name").and_then(|n| n.as_str()) {
+                if !name.is_empty() {
+                    return sanitize_project_name(name);
+                }
+            }
+        }
+    }
+
+    // 3. Check pyproject.toml
+    let pyproject = dir.join("pyproject.toml");
+    if let Ok(content) = fs::read_to_string(&pyproject) {
+        if let Ok(val) = toml::from_str::<toml::Value>(&content) {
+            if let Some(proj) = val.get("project") {
+                if let Some(name) = proj.get("name").and_then(|n| n.as_str()) {
+                    if !name.is_empty() {
+                        return sanitize_project_name(name);
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Git repository root name
     if let Ok(repo_root) = find_git_root(dir) {
         if let Some(name) = repo_root.file_name() {
             let s = name.to_string_lossy().to_string();
@@ -278,7 +389,7 @@ pub fn detect_project_name(dir: &Path) -> String {
         }
     }
 
-    // 2. Fall back to current directory name
+    // 5. Current directory name
     if let Ok(abs) = dir.canonicalize() {
         if let Some(name) = abs.file_name() {
             let s = name.to_string_lossy().to_string();
@@ -296,6 +407,13 @@ pub fn detect_project_name(dir: &Path) -> String {
     }
 
     "app".to_string()
+}
+
+pub fn save_project_name_if_needed(dir: &Path, name: &str) {
+    let xhip_file = dir.join(".xhip");
+    if !xhip_file.exists() {
+        let _ = fs::write(&xhip_file, format!("{}\n", name));
+    }
 }
 
 fn find_git_root(start: &Path) -> Result<PathBuf, ()> {

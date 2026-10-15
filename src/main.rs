@@ -6,12 +6,19 @@ mod archive;
 mod config;
 mod pull;
 mod s3;
+mod shorten;
+mod ui;
 
 use config::Config;
 use s3::S3Client;
 
 #[derive(Parser)]
-#[command(name = "xhip", version, about = "Simple, secure code shipping CLI to any VPS")]
+#[command(
+    name = "xhip",
+    version,
+    about = "Simple, secure code shipping CLI to any VPS using Cloudflare R2",
+    after_help = "Limits & Guidelines:\n  • Single archive upload limit: 5 GB (Cloudflare R2 single PUT limit)\n  • Recommended archive size: < 500 MB for fast VPS deployments\n  • Automatic .xhipignore: mirrors .gitignore if present, otherwise empty"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -22,13 +29,13 @@ enum Commands {
     /// Configure and validate Cloudflare R2 credentials
     Setup,
 
-    /// Package and upload project source to R2
+    /// Package and upload project source to R2 (auto-detects project name)
     Push {
         /// Project directory path (defaults to current directory)
         #[arg(value_name = "PATH")]
         path: Option<PathBuf>,
 
-        /// Override project name
+        /// Override project name (defaults to auto-detected name)
         #[arg(short, long)]
         name: Option<String>,
 
@@ -40,6 +47,14 @@ enum Commands {
         #[arg(long)]
         include_env: bool,
 
+        /// Automatically generate shipping link immediately after pushing
+        #[arg(short, long)]
+        link: bool,
+
+        /// Force re-sync .xhipignore from .gitignore (or empty if no .gitignore)
+        #[arg(long)]
+        sync_ignore: bool,
+
         /// Additional ignore patterns
         #[arg(long = "ignore", value_name = "PATTERN")]
         ignores: Vec<String>,
@@ -47,9 +62,9 @@ enum Commands {
 
     /// Generate a temporary presigned download URL for the project
     Link {
-        /// Project name in R2
+        /// Project name in R2 (defaults to current project)
         #[arg(value_name = "NAME")]
-        name: String,
+        name: Option<String>,
 
         /// Specific version timestamp or tag (defaults to latest)
         #[arg(short, long)]
@@ -58,6 +73,10 @@ enum Commands {
         /// Expiration lifetime in minutes (default: 10 minutes)
         #[arg(short, long, default_value_t = 10)]
         expires: u64,
+
+        /// Do not shorten the generated presigned URL
+        #[arg(long)]
+        no_short: bool,
     },
 
     /// Download and safely install project archive onto VPS
@@ -86,7 +105,7 @@ enum Commands {
         name: Option<String>,
     },
 
-    /// Show local configuration status without revealing secrets
+    /// Show local configuration status and upload limits
     Status,
 }
 
@@ -100,13 +119,16 @@ fn main() {
             name,
             dry_run,
             include_env,
+            link,
+            sync_ignore,
             ignores,
-        } => handle_push(path, name, dry_run, include_env, ignores),
+        } => handle_push(path, name, dry_run, include_env, link, sync_ignore, ignores),
         Commands::Link {
             name,
             version,
             expires,
-        } => handle_link(name, version, expires),
+            no_short,
+        } => handle_link(name, version, expires, no_short),
         Commands::Pull { url, url_flag, dir, checksum } => {
             let effective_url = url_flag.or(url);
             handle_pull(effective_url, dir, checksum)
@@ -116,22 +138,22 @@ fn main() {
     };
 
     if let Err(e) = result {
-        eprintln!("\x1b[1;31mError:\x1b[0m {}", e);
+        eprintln!("\n{} {}", ui::red_bold("Error:"), e);
         std::process::exit(1);
     }
 }
 
 fn handle_setup() -> Result<(), String> {
-    println!("\x1b[1;36m=== Xhip Setup ===\x1b[0m");
-    println!("Configure Cloudflare R2 credentials for shipping code.");
-    println!("Credentials will be stored with strict permissions (0600) on this machine only.\n");
+    ui::print_header("⚙️  XHIP SETUP — Cloudflare R2 Configuration");
+    println!("  Configure Cloudflare R2 credentials for shipping code.");
+    println!("  Credentials are stored with strict permissions (0600) on this machine only.\n");
 
-    let account_id = prompt_input("Cloudflare Account ID: ")?;
-    let access_key_id = prompt_input("R2 Access Key ID: ")?;
-    let secret_access_key = prompt_secret("R2 Secret Access Key: ")?;
-    let bucket = prompt_input("R2 Bucket Name: ")?;
+    let account_id = prompt_input("  Cloudflare Account ID: ")?;
+    let access_key_id = prompt_input("  R2 Access Key ID: ")?;
+    let secret_access_key = prompt_secret("  R2 Secret Access Key: ")?;
+    let bucket = prompt_input("  R2 Bucket Name: ")?;
 
-    println!("\nValidating connection to Cloudflare R2...");
+    println!("\n  Validating connection to Cloudflare R2...");
     let s3 = S3Client::new(
         account_id.clone(),
         access_key_id.clone(),
@@ -140,9 +162,9 @@ fn handle_setup() -> Result<(), String> {
     );
 
     s3.validate_credentials()?;
-    println!("\x1b[1;32m✓ Bucket connection verified successfully!\x1b[0m");
+    println!("  {}", ui::green_bold("✓ Bucket connection verified successfully!"));
 
-    let default_dir = prompt_optional_input("Default project directory (press Enter to skip): ")?;
+    let default_dir = prompt_optional_input("\n  Default project directory (press Enter to skip): ")?;
 
     let config = Config {
         account_id,
@@ -153,8 +175,8 @@ fn handle_setup() -> Result<(), String> {
     };
 
     let saved_path = config.save()?;
-    println!("\x1b[1;32m✓ Configuration saved securely to {}\x1b[0m", saved_path.display());
-    println!("You can now use `xhip push` to upload projects.");
+    println!("  {} {}\n", ui::green_bold("✓ Configuration saved securely to"), saved_path.display());
+    println!("  {}", ui::cyan_bold("You're all set! Use `xhip push` in any project folder to ship code."));
 
     Ok(())
 }
@@ -162,23 +184,27 @@ fn handle_setup() -> Result<(), String> {
 fn handle_status() -> Result<(), String> {
     let path = Config::config_path()?;
     if !path.exists() {
-        println!("Xhip status: \x1b[1;33mNot configured\x1b[0m");
-        println!("Run `xhip setup` to configure your Cloudflare R2 credentials.");
+        ui::print_header("⚙️  XHIP CONFIGURATION STATUS");
+        println!("  Status: {}", ui::yellow_bold("Not configured"));
+        println!("  Run {} to configure your Cloudflare R2 credentials.\n", ui::cyan_bold("xhip setup"));
         return Ok(());
     }
 
     let config = Config::load()?;
-    println!("\x1b[1;36m=== Xhip Configuration Status ===\x1b[0m");
-    println!("Config file:      {}", path.display());
-    println!("Account ID:       {}", config.account_id);
-    println!("Access Key ID:    {}", config.masked_access_key());
-    println!("Secret Key:       [SECURE - NEVER DISPLAYED]");
-    println!("R2 Bucket:        {}", config.bucket);
+    ui::print_header("⚙️  XHIP CONFIGURATION STATUS");
+    ui::print_item("Config file:", &path.display().to_string());
+    ui::print_item("Account ID:", &config.account_id);
+    ui::print_item("Access Key:", &config.masked_access_key());
+    ui::print_item("Secret Key:", "[SECURE - NEVER DISPLAYED]");
+    ui::print_item("R2 Bucket:", &config.bucket);
     if let Some(dir) = &config.default_project_dir {
-        println!("Default Dir:      {}", dir);
+        ui::print_item("Default Dir:", dir);
     }
-    println!("Permissions:      Owner Read/Write (0600)");
-    println!("\x1b[1;32mStatus:           Ready\x1b[0m");
+    ui::print_item("Upload Limit:", "5 GB per archive (single PUT limit)");
+    ui::print_item("Recommended:", "< 500 MB for fast VPS deployment");
+    ui::print_item("Permissions:", "0600 (Owner Read/Write)");
+    ui::print_success("Status:", "✓ Ready to ship code");
+    println!();
 
     Ok(())
 }
@@ -188,6 +214,8 @@ fn handle_push(
     name: Option<String>,
     dry_run: bool,
     include_env: bool,
+    auto_link: bool,
+    sync_ignore: bool,
     ignores: Vec<String>,
 ) -> Result<(), String> {
     let target_dir = match path {
@@ -199,18 +227,17 @@ fn handle_push(
         return Err(format!("Directory does not exist: {}", target_dir.display()));
     }
 
-    let detected_name = archive::detect_project_name(&target_dir);
+    // Determine project name automatically without prompting
     let project_name = match name {
-        Some(n) => archive::sanitize_project_name(&n),
+        Some(n) => {
+            let clean = archive::sanitize_project_name(&n);
+            archive::save_project_name_if_needed(&target_dir, &clean);
+            clean
+        }
         None => {
-            // Confirm with user if interactive, else use detected
-            if atty_is_terminal() {
-                let prompt = format!("Project name [{}]: ", detected_name);
-                let input = prompt_optional_input(&prompt)?;
-                input.unwrap_or(detected_name)
-            } else {
-                detected_name
-            }
+            let detected = archive::detect_project_name(&target_dir);
+            archive::save_project_name_if_needed(&target_dir, &detected);
+            detected
         }
     };
 
@@ -218,28 +245,48 @@ fn handle_push(
         return Err("Project name cannot be empty".to_string());
     }
 
-    println!("\x1b[1;34mScanning project:\x1b[0m {} (project name: \x1b[1m{}\x1b[0m)", target_dir.display(), project_name);
-    if include_env {
-        println!("\x1b[1;33mWARNING: --include-env enabled. .env files will be packaged!\x1b[0m");
-    }
+    // Check, initialize, or re-sync .xhipignore (synced from .gitignore if present, otherwise empty)
+    let (created_ignore, ignore_source) = if sync_ignore {
+        let desc = archive::sync_xhipignore(&target_dir)?;
+        (true, desc)
+    } else {
+        archive::ensure_xhipignore(&target_dir)?
+    };
 
     let files = archive::collect_files(&target_dir, &ignores, include_env)?;
-    println!("Files to include: {} files", files.len());
+
+    // Scan for unusually large individual files
+    let large_files = archive::scan_large_files(&target_dir, &files);
 
     if dry_run {
-        println!("\nDry Run: {}", project_name);
+        ui::print_header(&format!("🔍 DRY RUN: {}", project_name));
+        ui::print_item("Source:", &target_dir.display().to_string());
+        ui::print_item("Files:", &format!("{} files to package", files.len()));
+        if created_ignore {
+            ui::print_item("Ignore File:", &format!(".xhipignore ({})", ignore_source));
+        }
+
+        if !large_files.is_empty() {
+            println!("\n  {}", ui::yellow_bold("⚠️  Large files detected (>= 50 MB):"));
+            for lf in &large_files {
+                println!("    • {} ({})", lf.relative_path, archive::format_bytes(lf.size_bytes));
+            }
+            println!("    {}", ui::dim("If unneeded on the VPS, add these patterns to .xhipignore"));
+        }
+
         let rel_paths: Vec<PathBuf> = files
             .iter()
             .filter_map(|f| f.strip_prefix(&target_dir).ok().map(|p| p.to_path_buf()))
             .collect();
 
+        println!();
         print!("{}", archive::render_file_tree(&project_name, &rel_paths));
-        println!("{} files to package (.xhipignore active).", files.len());
         return Ok(());
     }
 
     let package = archive::create_archive(&target_dir, &files)?;
-    let archive_size_kb = package.tar_gz_bytes.len() as f64 / 1024.0;
+    let archive_size_formatted = archive::format_bytes(package.tar_gz_bytes.len() as u64);
+    let uncompressed_size_formatted = archive::format_bytes(package.uncompressed_size_bytes);
 
     let config = Config::load()?;
     let s3 = S3Client::new(
@@ -258,15 +305,44 @@ fn handle_push(
     s3.put_object(&checksum_key, package.checksum_hex.as_bytes(), "text/plain")?;
     s3.put_object(&latest_key, version.as_bytes(), "text/plain")?;
 
-    println!("\x1b[1;32m✓ Pushed\x1b[0m {} (v{}) [{:.1} KB]", project_name, version, archive_size_kb);
-    println!("Checksum: {}", package.checksum_hex);
-    println!("\nNext command to create link:");
-    println!("  xhip link {}", project_name);
+    ui::print_header("📦 XHIP PUSH — Project Shipped");
+    ui::print_item("Project:", &project_name);
+    ui::print_item("Version:", &format!("v{}", version));
+    ui::print_item("Files:", &format!("{} files included", files.len()));
+    ui::print_item("Archive Size:", &format!("{} ({})", archive_size_formatted, ui::dim(&format!("uncompressed: {}", uncompressed_size_formatted))));
+    ui::print_item("Checksum:", &package.checksum_hex);
+    if created_ignore {
+        ui::print_item("Ignore File:", &format!(".xhipignore ({})", ignore_source));
+    }
+    if include_env {
+        ui::print_warning("Environment:", "⚠️  .env files included (--include-env enabled)");
+    }
+    ui::print_success("Status:", "✓ Uploaded to Cloudflare R2");
+
+    if !large_files.is_empty() {
+        println!("\n  {}", ui::yellow_bold("⚠️  Notice: Large files included in archive (>= 50 MB):"));
+        for lf in &large_files {
+            println!("    • {} ({})", lf.relative_path, archive::format_bytes(lf.size_bytes));
+        }
+        println!("    {}", ui::dim("Limit: 5 GB per archive. Exclude unneeded files via .xhipignore."));
+    }
+
+    if auto_link {
+        handle_link(Some(project_name), Some(version), 10, false)?;
+    } else {
+        println!("\n  {}", ui::cyan_bold("🔗 Generate a shipping link:"));
+        println!("     xhip link\n");
+    }
 
     Ok(())
 }
 
-fn handle_link(name: String, version: Option<String>, expires_minutes: u64) -> Result<(), String> {
+fn handle_link(
+    name: Option<String>,
+    version: Option<String>,
+    expires_minutes: u64,
+    no_short: bool,
+) -> Result<(), String> {
     let config = Config::load()?;
     let s3 = S3Client::new(
         config.account_id,
@@ -275,18 +351,27 @@ fn handle_link(name: String, version: Option<String>, expires_minutes: u64) -> R
         config.bucket,
     );
 
-    let project_name = archive::sanitize_project_name(&name);
+    // Resolve project name: CLI arg -> detected from current folder
+    let project_name = match name {
+        Some(n) => archive::sanitize_project_name(&n),
+        None => {
+            let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            archive::detect_project_name(&current_dir)
+        }
+    };
+
+    if project_name.is_empty() {
+        return Err("Could not determine project name. Please specify: xhip link <project>".to_string());
+    }
 
     // Determine target version
     let target_version = match version {
         Some(v) => v,
         None => {
-            // Find latest version from R2
             let prefix = format!("{}/", project_name);
             let objects = s3.list_objects(Some(&prefix))?;
             let mut versions = Vec::new();
             for obj in objects {
-                // obj format: <project>/<version>/archive.tar.gz
                 let parts: Vec<&str> = obj.split('/').collect();
                 if parts.len() >= 3 && parts[2] == "archive.tar.gz" {
                     versions.push(parts[1].to_string());
@@ -309,19 +394,47 @@ fn handle_link(name: String, version: Option<String>, expires_minutes: u64) -> R
     let expires_seconds = expires_minutes * 60;
     let presigned_url = s3.generate_presigned_url(&object_key, expires_seconds)?;
 
-    println!("Project:  {} (v{}, {}m expiry)", project_name, target_version, expires_minutes);
-    println!("URL:      {}", presigned_url);
-    println!("\nPull command for VPS:");
-    println!("  xhip pull --url \"{}\"", presigned_url);
+    // Attempt URL shortening unless explicitly disabled
+    let short_url_opt = if !no_short {
+        shorten::shorten_url(&presigned_url)
+    } else {
+        None
+    };
+
+    let effective_shipping_url = short_url_opt.as_deref().unwrap_or(&presigned_url);
+
+    ui::print_header("🚀 XHIP SHIPPING LINK");
+    ui::print_item("Project:", &project_name);
+    ui::print_item("Version:", &format!("v{}", target_version));
+    ui::print_item("Expires:", &format!("{} minutes", expires_minutes));
+
+    if let Some(ref short_url) = short_url_opt {
+        println!();
+        println!("  {}", ui::cyan_bold("🔗 Short Shipping Link:"));
+        println!("     {}", ui::bold(short_url));
+    }
+
+    println!();
+    println!("  {}", ui::green_bold("📋 VPS Pull Command (run on remote server):"));
+    println!("     xhip pull --url \"{}\"", effective_shipping_url);
+
+    println!();
+    println!("  {}", ui::dim("🔒 Direct Storage URL:"));
+    println!("     {}", ui::dim(&presigned_url));
+    println!();
 
     Ok(())
 }
 
-fn handle_pull(url_opt: Option<String>, dir: Option<PathBuf>, checksum: Option<String>) -> Result<(), String> {
+fn handle_pull(
+    url_opt: Option<String>,
+    dir: Option<PathBuf>,
+    checksum: Option<String>,
+) -> Result<(), String> {
     let url = match url_opt {
         Some(u) => u,
         None => {
-            print!("Enter shipping URL: ");
+            print!("  Enter shipping URL: ");
             io::stdout().flush().map_err(|e| e.to_string())?;
             let mut line = String::new();
             io::stdin().read_line(&mut line).map_err(|e| e.to_string())?;
@@ -342,13 +455,19 @@ fn handle_pull(url_opt: Option<String>, dir: Option<PathBuf>, checksum: Option<S
         }
     };
 
+    println!("\n  Downloading archive from shipping URL...");
     let archive_bytes = pull::download_archive(&url)?;
     let result = pull::safe_unpack_and_install(&archive_bytes, &dest_dir, checksum.as_deref())?;
 
-    println!("\x1b[1;32m✓ Installed\x1b[0m to {} ({} files)", dest_dir.display(), result.extracted_files_count);
+    ui::print_header("📥 XHIP PULL & DEPLOY");
+    ui::print_item("Destination:", &dest_dir.display().to_string());
+    ui::print_item("Extracted:", &format!("{} files", result.extracted_files_count));
+    ui::print_item("Integrity:", "✓ SHA-256 verified");
     if !result.preserved_items.is_empty() {
-        println!("Preserved: {}", result.preserved_items.join(", "));
+        ui::print_item("Preserved:", &result.preserved_items.join(", "));
     }
+    ui::print_success("Status:", "✓ Successfully deployed!");
+    println!();
 
     Ok(())
 }
@@ -377,19 +496,23 @@ fn handle_list(name_filter: Option<String>) -> Result<(), String> {
     }
 
     if project_versions.is_empty() {
-        println!("No projects found in bucket '{}'.", s3.bucket);
+        ui::print_header("📋 XHIP PROJECTS IN R2");
+        println!("  No projects found in bucket '{}'.", s3.bucket);
         return Ok(());
     }
 
-    println!("\x1b[1;36m=== Projects in R2 ({}) ===\x1b[0m", s3.bucket);
+    ui::print_header(&format!("📋 XHIP PROJECTS IN R2 ({})", s3.bucket));
     for (proj, mut versions) in project_versions {
         versions.sort();
-        println!("\nProject: \x1b[1m{}\x1b[0m", proj);
-        println!("Versions ({} total):", versions.len());
-        for v in &versions {
-            let marker = if v == versions.last().unwrap() { " (latest)" } else { "" };
-            println!("  - {}{}", v, marker);
+        let total = versions.len();
+        println!("  • {} ({})", ui::bold(&proj), ui::dim(&format!("{} version{}", total, if total == 1 { "" } else { "s" })));
+        for (i, v) in versions.iter().enumerate() {
+            let is_last = i + 1 == total;
+            let branch = if is_last { "└──" } else { "├──" };
+            let latest_tag = if is_last { ui::green_bold(" [latest]") } else { String::new() };
+            println!("    {} v{}{}", branch, v, latest_tag);
         }
+        println!();
     }
 
     Ok(())
@@ -431,16 +554,9 @@ fn prompt_secret(prompt: &str) -> Result<String, String> {
     Ok(trimmed)
 }
 
-fn atty_is_terminal() -> bool {
-    use is_terminal::IsTerminal;
-    std::io::stdin().is_terminal()
-}
-
 fn extract_project_name_from_url(url: &str) -> Option<String> {
-    // URL path usually has /<bucket>/<project>/<version>/archive.tar.gz
     if let Ok(parsed) = url::Url::parse(url) {
         let segments: Vec<&str> = parsed.path_segments()?.collect();
-        // [bucket, project, version, archive.tar.gz]
         if segments.len() >= 4 {
             return Some(segments[1].to_string());
         } else if segments.len() >= 3 {

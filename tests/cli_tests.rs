@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::fs;
 use tempfile::tempdir;
 
@@ -33,6 +35,9 @@ fn test_exclusions_and_env_protection() {
     fs::write(root.join(".git/config"), "[core]").unwrap();
     fs::create_dir_all(root.join("build")).unwrap();
     fs::write(root.join("build/bundle.js"), "// build").unwrap();
+
+    // Create .gitignore which .xhipignore will now mirror
+    fs::write(root.join(".gitignore"), "id_rsa\n*.key\nnode_modules/\nbuild/\n").unwrap();
 
     // Normal collection: .env, node_modules, keys, .git should NOT be collected
     let files = archive::collect_files(root, &[], false).unwrap();
@@ -191,4 +196,79 @@ fn test_s3_presigned_url_generation() {
     assert!(url.contains("X-Amz-Credential=mock_access_key"));
     assert!(url.contains("X-Amz-Expires=600"));
     assert!(url.contains("X-Amz-Signature="));
+}
+
+#[test]
+fn test_xhipignore_copies_gitignore() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+
+    // Create a .gitignore file
+    let gitignore_content = "target/\n*.log\nsecrets.txt\n";
+    fs::write(root.join(".gitignore"), gitignore_content).unwrap();
+
+    let (created, desc) = archive::ensure_xhipignore(root).unwrap();
+    assert!(created);
+    assert_eq!(desc, "copied from .gitignore");
+
+    let xhipignore_content = fs::read_to_string(root.join(".xhipignore")).unwrap();
+    assert_eq!(xhipignore_content, gitignore_content);
+}
+
+#[test]
+fn test_xhipignore_empty_when_no_gitignore() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+
+    // No .gitignore present
+    let (created, desc) = archive::ensure_xhipignore(root).unwrap();
+    assert!(created);
+    assert_eq!(desc, "created empty");
+
+    let xhipignore_content = fs::read_to_string(root.join(".xhipignore")).unwrap();
+    assert!(xhipignore_content.is_empty());
+}
+
+#[test]
+fn test_detect_project_name_priority() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+
+    // 1. Cargo.toml
+    fs::write(root.join("Cargo.toml"), "[package]\nname = \"my-rust-crate\"\nversion = \"0.1.0\"\n").unwrap();
+    assert_eq!(archive::detect_project_name(root), "my-rust-crate");
+
+    // 2. .xhip file has highest priority
+    fs::write(root.join(".xhip"), "custom-override-name\n").unwrap();
+    assert_eq!(archive::detect_project_name(root), "custom-override-name");
+}
+
+#[test]
+fn test_detect_project_name_package_json() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+
+    fs::write(root.join("package.json"), "{\"name\": \"my-node-service\"}").unwrap();
+    assert_eq!(archive::detect_project_name(root), "my-node-service");
+}
+
+#[test]
+fn test_format_bytes() {
+    assert_eq!(archive::format_bytes(500), "500 B");
+    assert_eq!(archive::format_bytes(1024), "1.0 KB");
+    assert_eq!(archive::format_bytes(1024 * 1024 * 5), "5.0 MB");
+    assert_eq!(archive::format_bytes(1024 * 1024 * 1024 * 2), "2.00 GB");
+}
+
+#[test]
+fn test_large_file_scan() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+
+    let small = root.join("small.txt");
+    fs::write(&small, "hello").unwrap();
+
+    let files = vec![small];
+    let large = archive::scan_large_files(root, &files);
+    assert!(large.is_empty());
 }
